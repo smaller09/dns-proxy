@@ -13,7 +13,9 @@
  *  along with this program; if not, write to the Free Software
  *  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
  * */
-
+#define _GNU_SOURCE
+#include <time.h>
+#include <sys/time.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -24,15 +26,15 @@
 #include <signal.h>
 #include <unistd.h>
 #include <getopt.h>
-#include <pthread.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <netinet/udp.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
-#include <unistd.h>
+#include <pthread.h>
 #include <semaphore.h>
-#include <sys/time.h>
 
 char SOCKS5_ADDR[16] = {"127.0.0.1"};
 in_port_t SOCKS5_PORT = 1080;
@@ -52,21 +54,24 @@ sem_t thread_sem;
 
 typedef struct
 {
-	unsigned char payload[2048];
-	short int payload_len;
-	struct sockaddr client_addr;
 	socklen_t addr_len;
+	struct sockaddr client_addr;
+	int payload_len;
+	unsigned char payload[2048];
 } dns_payload;
 
 int udp_socks;
+struct sockaddr_in server_addr;
 
-void *
-handle_thread(void *arg)
+void *handle_thread(void *arg)
 {
 	dns_payload *data = arg;
 	struct sockaddr client_addr;
 	socklen_t addr_len;
 	unsigned char query[2048];
+	unsigned char tmp[1024];
+	int tcp_socks;
+
 	addr_len = data->addr_len;
 	memcpy(&client_addr, &(data->client_addr), addr_len);
 
@@ -76,33 +81,27 @@ handle_thread(void *arg)
 	query[0] = 0;
 	query[1] = data->payload_len;
 
-	int tcp_socks;
-
-	unsigned char tmp[1024];
-
-	struct sockaddr_in socks5_server;
-	memset(&socks5_server, 0, sizeof(socks5_server));
-	socks5_server.sin_family = AF_INET;
-	socks5_server.sin_port = socks5_port;
-	socks5_server.sin_addr.s_addr = socks5_addr;
-
 	tcp_socks = socket(AF_INET, SOCK_STREAM, 0);
 
 	if (tcp_socks < 0)
 	{
-		perror("[!] Error creating TCP socket");
+		perror("[!] Error create TCP socket");
 		goto ERROR_EXIT;
 	}
-	if (connect(tcp_socks, (struct sockaddr *)&socks5_server,
-				sizeof(socks5_server)) < 0)
+	if (connect(tcp_socks, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0)
 	{
-		perror("[!] Error connecting to proxy");
+		perror("[!] Error connect to proxy");
 		goto ERROR_EXIT;
 	}
 
 	struct timeval timeout = {5, 0};
 	setsockopt(tcp_socks, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 	setsockopt(tcp_socks, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+	const int opt = 1;
+	setsockopt(tcp_socks, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+	setsockopt(tcp_socks, SOL_SOCKET, SO_KEEPALIVE, (void *)&opt, sizeof(opt));
+	setsockopt(tcp_socks, SOL_TCP, TCP_NODELAY, &opt, sizeof(opt));
+	setsockopt(tcp_socks, SOL_SOCKET, MSG_NOSIGNAL, (void *)&opt, sizeof(opt));
 
 	// socks handshake
 	if (send(tcp_socks, "\x05\x01\x00", 3, 0) < 0)
@@ -127,44 +126,33 @@ handle_thread(void *arg)
 
 	if (send(tcp_socks, tmp, 10, 0) < 0)
 	{
-		perror("[!] Error send connection to proxy");
+		perror("[!] Error send to proxy");
 		goto ERROR_EXIT;
 	}
 	if (recv(tcp_socks, tmp, 1024, 0) < 0)
 	{
-		perror("[!] Error proxy connection reply");
+		perror("[!] Error proxy reply");
 		goto ERROR_EXIT;
 	}
 	if (tmp[1])
 	{
-		printf("[!] Error connection to remote %x \n", tmp[1]);
+		printf("[!] Error connect to remote %x \n", tmp[1]);
 		goto ERROR_EXIT;
 	}
-SEND:
 	// forward dns query
 	if (send(tcp_socks, query, query[1] + 2, 0) < 0)
 	{
-		if (errno == EAGAIN)
-			goto SEND;
-		else
-		{
-			perror("[!] Error send payload to proxy");
-			goto ERROR_EXIT;
-		}
-	};
+		perror("[!] Error send payload to proxy");
+		goto ERROR_EXIT;
+	}
 
 	int lenght;
-RECEIVE:
+	
 	lenght = recv(tcp_socks, query, 2048, 0);
 	if (lenght < 0)
 	{
-		if (errno == EAGAIN)
-			goto RECEIVE;
-		else
-		{
-			perror("[!] Error receive payload from proxy");
-			goto ERROR_EXIT;
-		}
+		perror("[!] Error receive payload from proxy");
+		goto ERROR_EXIT;
 	}
 
 	// send the reply back to the client (minus the length at the beginning)
@@ -175,27 +163,36 @@ ERROR_EXIT:
 	pthread_exit(NULL);
 }
 
-void dns_listener()
+void DNS_Listener()
 {
+	pthread_attr_t attr;
+	pthread_attr_init(&attr);
+	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+
 	pthread_t thread_id;
 	dns_payload buffer;
-	struct sockaddr_in dns_listener;
-	memset(&dns_listener, 0, sizeof(dns_listener));
-
-	dns_listener.sin_family = AF_INET;
-	dns_listener.sin_port = listen_port;
-	dns_listener.sin_addr.s_addr = listen_addr;
+	memset(&server_addr, 0, sizeof(server_addr));
+	server_addr.sin_family = AF_INET;
+	server_addr.sin_port = listen_port;
+	server_addr.sin_addr.s_addr = listen_addr;
 
 	udp_socks = socket(AF_INET, SOCK_DGRAM, 0);
 
 	if (udp_socks < 0)
+	{
 		perror("[!] Error setting up dns proxy");
-
-	if (bind(udp_socks, (struct sockaddr *)&dns_listener,
-			 sizeof(dns_listener)) < 0)
+		exit(EXIT_FAILURE);
+	}
+	if (bind(udp_socks, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0)
+	{
 		perror("[!] Error binding on dns proxy");
+		exit(EXIT_FAILURE);
+	}
+	server_addr.sin_family = AF_INET;
+	server_addr.sin_port = socks5_port;
+	server_addr.sin_addr.s_addr = socks5_addr;
 
-	socklen_t dns_client_size = sizeof(struct sockaddr_in);
+	buffer.addr_len = sizeof(buffer.client_addr);
 
 	while (true)
 	{
@@ -209,12 +206,9 @@ void dns_listener()
 			continue;
 		}
 		sem_wait(&thread_sem);
-		if (pthread_create(&thread_id, NULL, handle_thread, &buffer) != 0)
+		if (pthread_create(&thread_id, &attr, handle_thread, &buffer) != 0)
 			perror("Failed to create thread");
-		else
-			pthread_detach(thread_id);
 	}
-	return;
 }
 
 void print_command_help(void)
@@ -382,9 +376,8 @@ int main(int argc, char *argv[])
 {
 	signal(SIGPIPE, SIG_IGN);
 
-	sem_init(&thread_sem, 0, 1);
-
 	parse_command_args(argc, argv);
+
 	dns_addr = inet_addr(DNS_ADDR);
 	socks5_addr = inet_addr(SOCKS5_ADDR);
 	listen_addr = inet_addr(LISTEN_ADDR);
@@ -397,7 +390,9 @@ int main(int argc, char *argv[])
 	printf("socks5 address: %s:%hu \n", SOCKS5_ADDR, SOCKS5_PORT);
 	printf("dns server address: %s:%hu \n", DNS_ADDR, DNS_PORT);
 
-	dns_listener();
+	sem_init(&thread_sem, 0, 1);
+
+	DNS_Listener();
 
 	close(udp_socks);
 	exit(EXIT_SUCCESS);
