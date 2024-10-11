@@ -35,7 +35,6 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <pthread.h>
-#include <semaphore.h>
 
 #define MAXWORKERS 8
 
@@ -45,7 +44,7 @@ in_addr_t socks5_addr;
 in_port_t socks5_port;
 
 char LISTEN_ADDR[16] = {"127.0.0.1"};
-in_port_t LISTEN_PORT = 5300;
+in_port_t LISTEN_PORT = 3300;
 in_addr_t listen_addr;
 in_port_t listen_port;
 
@@ -65,7 +64,7 @@ typedef struct
 
 typedef struct
 {
-    sem_t sem;
+    pthread_cond_t cond;
     pthread_t thread_id;
     int busy;
 } work_s;
@@ -153,34 +152,40 @@ handle_thread(void *arg)
 {
     int id = (int)arg;
     int tcp_socks;
+    pthread_mutex_t mutex;
 
     struct timespec ts;
     struct tcp_info info;
     int info_len = sizeof(info);
 
+    pthread_mutex_init(&mutex, NULL);
+
     if (connect_tcp(&tcp_socks))
         goto ERROR_EXIT;
-    int counter;
+    int counter, tmp;
 
     while (true)
     {
 
-        clock_gettime(CLOCK_REALTIME, &ts);
+        clock_gettime(CLOCK_MONOTONIC, &ts);
         ts.tv_sec += 30;
-        if (sem_timedwait(&(workers[id].status.sem), &ts) < 0 && errno == ETIMEDOUT)
-            break;
+        pthread_mutex_lock(&mutex);
+        tmp = pthread_cond_timedwait(&(workers[id].status.cond), &mutex, &ts);
         getsockopt(tcp_socks, IPPROTO_TCP, TCP_INFO, &info, (socklen_t *)&info_len);
-        if ((info.tcpi_state != TCP_ESTABLISHED))
-        {
-            close(tcp_socks);
-            if (connect_tcp(&tcp_socks) == 0)
+
+        if (info.tcpi_state != TCP_ESTABLISHED)
+            if (tmp == 0)
             {
-                workers[id].status.busy = 0;
-                continue;
+                close(tcp_socks);
+                if (connect_tcp(&tcp_socks) != 0)
+                    break;
             }
             else
-                goto ERROR_EXIT;
-        }
+                break;
+        else
+            if (tmp == ETIMEDOUT)
+                continue;
+
         // forward dns query
         counter = 0;
         while (send(tcp_socks, &(workers[id].payload.tcp_len_header), workers[id].payload.payload_len + sizeof(workers->payload.tcp_len_header), 0) < 0)
@@ -219,9 +224,11 @@ handle_thread(void *arg)
         // send the reply back to the client (minus the length at the beginning)
         sendto(udp_socks, workers[id].payload.payload, lenght - sizeof(workers->payload.tcp_len_header), 0, &workers[id].payload.client_addr, workers[id].payload.addr_len);
         workers[id].status.busy = 0;
+        pthread_mutex_unlock(&mutex);
     }
 ERROR_EXIT:
     close(tcp_socks);
+    pthread_mutex_unlock(&mutex);
     workers[id].status.busy = 0;
     workers[id].status.thread_id = 0;
     pthread_exit(NULL);
@@ -256,17 +263,22 @@ void udp_bind(int *socks)
 
 void DNS_Listener()
 {
+    udp_bind(&udp_socks);
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    payload_s buffer;
 
-    udp_bind(&udp_socks);
+    payload_s buffer;
+    pthread_condattr_t cattr;
 
     memset(&workers, 0, sizeof(workers));
 
+    pthread_condattr_init(&cattr);
+    pthread_condattr_setclock(&cattr, CLOCK_MONOTONIC);
+
     for (int i = 0; i < MAXWORKERS; i++)
-        sem_init(&(workers[i].status.sem), 0, 0);
+        pthread_cond_init(&(workers[i].status.cond), &cattr);
+    pthread_condattr_destroy(&cattr);
 
     buffer.addr_len = sizeof(buffer.client_addr);
     int min;
@@ -293,7 +305,7 @@ void DNS_Listener()
             break;
         }
 
-        if (min >= MAXWORKERS)
+        if (min == MAXWORKERS)
         {
             printf("Run Out of Thread...");
             continue;
@@ -309,7 +321,7 @@ void DNS_Listener()
         if (workers[min].status.thread_id)
         {
             workers[min].status.busy = 1;
-            sem_post(&(workers[min].status.sem));
+            pthread_cond_signal(&(workers[min].status.cond));
             continue;
         }
 
@@ -320,8 +332,7 @@ void DNS_Listener()
             perror("Failed to create thread");
             continue;
         }
-        workers[min].status.busy = 1;
-        sem_post(&(workers[min].status.sem));
+        pthread_cond_signal(&(workers[min].status.cond));
     }
 }
 
