@@ -49,7 +49,7 @@ in_port_t LISTEN_PORT = 5300;
 in_addr_t listen_addr;
 in_port_t listen_port;
 
-char DNS_ADDR[16] = {"4.2.2.2"};
+char DNS_ADDR[16] = {"8.8.8.8"};
 in_port_t DNS_PORT = 53;
 in_addr_t dns_addr;
 in_port_t dns_port;
@@ -99,7 +99,8 @@ int connect_tcp(int *socks)
     setsockopt(*socks, SOL_TCP, TCP_NODELAY, &opt, sizeof(opt));
     setsockopt(*socks, SOL_SOCKET, MSG_NOSIGNAL, &opt, sizeof(opt));
 
-    if (connect(*socks, (struct sockaddr *)&server_addr, sizeof(server_addr)))
+    if (connect(*socks, (struct sockaddr *)&server_addr,
+                sizeof(server_addr)))
     {
         perror("[!] Error connect TCP socket");
         return 1;
@@ -164,26 +165,27 @@ handle_thread(void *arg)
 
     while (true)
     {
-
         clock_gettime(CLOCK_REALTIME, &ts);
         ts.tv_sec += 30;
-        if (sem_timedwait(&(workers[id].status.sem), &ts) < 0 && errno == ETIMEDOUT)
+        if (sem_timedwait(&(workers[id].status.sem), &ts) < 0 &&
+            errno == ETIMEDOUT)
             break;
-        getsockopt(tcp_socks, IPPROTO_TCP, TCP_INFO, &info, (socklen_t *)&info_len);
+        else
+            continue;
+        getsockopt(tcp_socks, IPPROTO_TCP, TCP_INFO, &info,
+                   (socklen_t *)&info_len);
         if ((info.tcpi_state != TCP_ESTABLISHED))
         {
             close(tcp_socks);
-            if (connect_tcp(&tcp_socks) == 0)
-            {
-                workers[id].status.busy = 0;
-                continue;
-            }
-            else
-                goto ERROR_EXIT;
+            if (connect_tcp(&tcp_socks) != 0)
+                break;
         }
         // forward dns query
         counter = 0;
-        while (send(tcp_socks, &(workers[id].payload.tcp_len_header), workers[id].payload.payload_len + sizeof(workers->payload.tcp_len_header), 0) < 0)
+        while (send(tcp_socks, &(workers[id].payload.tcp_len_header),
+                    workers[id].payload.payload_len +
+                        sizeof(workers->payload.tcp_len_header),
+                    0) < 0)
         {
             if ((errno != EAGAIN) && (errno != EINTR))
             {
@@ -199,7 +201,8 @@ handle_thread(void *arg)
         counter = 0;
         while (true)
         {
-            lenght = recv(tcp_socks, &(workers[id].payload.tcp_len_header), 2024, 0);
+            lenght = recv(tcp_socks, &(workers[id].payload.tcp_len_header),
+                          2024, 0);
             if (lenght < 0)
             {
                 if ((errno != EAGAIN) && (errno != EINTR))
@@ -217,7 +220,9 @@ handle_thread(void *arg)
         }
 
         // send the reply back to the client (minus the length at the beginning)
-        sendto(udp_socks, workers[id].payload.payload, lenght - sizeof(workers->payload.tcp_len_header), 0, &workers[id].payload.client_addr, workers[id].payload.addr_len);
+        sendto(udp_socks, workers[id].payload.payload,
+               lenght - sizeof(workers->payload.tcp_len_header), 0,
+               &workers[id].payload.client_addr, workers[id].payload.addr_len);
         workers[id].status.busy = 0;
     }
 ERROR_EXIT:
@@ -243,7 +248,8 @@ void udp_bind(int *socks)
         exit(EXIT_FAILURE);
     }
 
-    if (bind(*socks, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0)
+    if (bind(*socks, (struct sockaddr *)&server_addr, sizeof(server_addr)) <
+        0)
     {
         perror("[!] Error binding to listen proxy");
         exit(EXIT_FAILURE);
@@ -273,7 +279,9 @@ void DNS_Listener()
 
     while (true)
     {
-        buffer.payload_len = (recvfrom(udp_socks, buffer.payload, 2022, 0, &(buffer.client_addr), &(buffer.addr_len)));
+        buffer.payload_len =
+            (recvfrom(udp_socks, buffer.payload, 2022, 0,
+                      &(buffer.client_addr), &(buffer.addr_len)));
         if (buffer.payload_len < 0)
         {
             if ((errno == EAGAIN) || (errno == EINTR))
@@ -299,7 +307,10 @@ void DNS_Listener()
             continue;
         }
         buffer.tcp_len_header = htobe16((short int)buffer.payload_len);
-        memcpy(&(workers[min].payload), &buffer, sizeof(buffer.addr_len) + sizeof(buffer.client_addr) + sizeof(buffer.payload_len) + sizeof(buffer.tcp_len_header) + buffer.payload_len);
+        memcpy(&(workers[min].payload), &buffer,
+               sizeof(buffer.addr_len) + sizeof(buffer.client_addr) +
+                   sizeof(buffer.payload_len) +
+                   sizeof(buffer.tcp_len_header) + buffer.payload_len);
         /*
                 memcpy(&(workers[min].payload.client_addr),&(buffer.client_addr),sizeof(buffer.client_addr));
                 memcpy(&(workers[min].payload.payload),&(buffer.payload),buffer.payload_len);
@@ -313,7 +324,8 @@ void DNS_Listener()
             continue;
         }
 
-        if (pthread_create(&workers[min].status.thread_id, &attr, handle_thread, (void *)min))
+        if (pthread_create(&workers[min].status.thread_id, &attr,
+                           handle_thread, (void *)min))
         {
             workers[min].status.thread_id = 0;
             workers[min].status.busy = 0;
