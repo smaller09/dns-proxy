@@ -35,7 +35,6 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <pthread.h>
-#include <semaphore.h>
 
 #define MAXWORKERS 8
 
@@ -65,7 +64,7 @@ typedef struct
 
 typedef struct
 {
-    sem_t sem;
+    pthread_cond_t cond;
     pthread_t thread_id;
     int busy;
 } work_s;
@@ -153,10 +152,13 @@ handle_thread(void *arg)
 {
     int id = (int)arg;
     int tcp_socks;
+    pthread_mutex_t mutex;
 
     struct timespec ts;
     struct tcp_info info;
     int info_len = sizeof(info);
+
+    pthread_mutex_init(&mutex, NULL);
 
     if (connect_tcp(&tcp_socks))
         goto ERROR_EXIT;
@@ -165,21 +167,22 @@ handle_thread(void *arg)
     while (true)
     {
 
-        clock_gettime(CLOCK_REALTIME, &ts);
+        clock_gettime(CLOCK_MONOTONIC, &ts);
         ts.tv_sec += 30;
-        if (sem_timedwait(&(workers[id].status.sem), &ts) < 0 && errno == ETIMEDOUT)
+        // pthread_mutex_lock(&mutex);
+        if (pthread_cond_timedwait(&(workers[id].status.cond), &mutex, &ts) == ETIMEDOUT)
+        {
+            pthread_mutex_unlock(&mutex);
             break;
+        }
+        pthread_mutex_unlock(&mutex);
+
         getsockopt(tcp_socks, IPPROTO_TCP, TCP_INFO, &info, (socklen_t *)&info_len);
-        if ((info.tcpi_state != TCP_ESTABLISHED))
+        if (info.tcpi_state != TCP_ESTABLISHED)
         {
             close(tcp_socks);
-            if (connect_tcp(&tcp_socks) == 0)
-            {
-                workers[id].status.busy = 0;
-                continue;
-            }
-            else
-                goto ERROR_EXIT;
+            if (connect_tcp(&tcp_socks) != 0)
+                break;
         }
         // forward dns query
         counter = 0;
@@ -256,17 +259,22 @@ void udp_bind(int *socks)
 
 void DNS_Listener()
 {
+    udp_bind(&udp_socks);
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    payload_s buffer;
 
-    udp_bind(&udp_socks);
+    payload_s buffer;
+    pthread_condattr_t cattr;
 
     memset(&workers, 0, sizeof(workers));
 
+    pthread_condattr_init(&cattr);
+    pthread_condattr_setclock(&cattr, CLOCK_MONOTONIC);
+
     for (int i = 0; i < MAXWORKERS; i++)
-        sem_init(&(workers[i].status.sem), 0, 0);
+        pthread_cond_init(&(workers[i].status.cond), &cattr);
+    pthread_condattr_destroy(&cattr);
 
     buffer.addr_len = sizeof(buffer.client_addr);
     int min;
@@ -293,10 +301,21 @@ void DNS_Listener()
             break;
         }
 
-        if (min >= MAXWORKERS)
+        if (min == MAXWORKERS)
         {
             printf("Run Out of Thread...");
             continue;
+        }
+        if (workers[min].status.thread_id == 0)
+        {
+            if (pthread_create(&workers[min].status.thread_id, &attr, handle_thread, (void *)min))
+            {
+                workers[min].status.thread_id = 0;
+                workers[min].status.busy = 0;
+                perror("Failed to create thread");
+                continue;
+            }
+            sleep(1);
         }
         buffer.tcp_len_header = htobe16((short int)buffer.payload_len);
         memcpy(&(workers[min].payload), &buffer, sizeof(buffer.addr_len) + sizeof(buffer.client_addr) + sizeof(buffer.payload_len) + sizeof(buffer.tcp_len_header) + buffer.payload_len);
@@ -306,22 +325,9 @@ void DNS_Listener()
                 workers[min].payload.addr_len=buffer.addr_len;
                 workers[min].payload.payload_len=buffer.payload_len;
         */
-        if (workers[min].status.thread_id)
-        {
-            workers[min].status.busy = 1;
-            sem_post(&(workers[min].status.sem));
-            continue;
-        }
 
-        if (pthread_create(&workers[min].status.thread_id, &attr, handle_thread, (void *)min))
-        {
-            workers[min].status.thread_id = 0;
-            workers[min].status.busy = 0;
-            perror("Failed to create thread");
-            continue;
-        }
         workers[min].status.busy = 1;
-        sem_post(&(workers[min].status.sem));
+        pthread_cond_signal(&(workers[min].status.cond));
     }
 }
 
