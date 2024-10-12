@@ -1,0 +1,110 @@
+From e125306b4770d790930180c6adede375f3e70f92 Mon Sep 17 00:00:00 2001
+From: smaller09 <iamfool@msn.com>
+Date: Sat, 12 Oct 2024 00:37:44 +0800
+Subject: [PATCH] add sem_clockwait()
+
+---
+ compat/time32/sem_clockwait_time32.c |  9 ++++++++
+ compat/time32/time32.h               |  1 +
+ include/semaphore.h                  |  2 ++
+ src/thread/sem_clockwait.c           | 33 ++++++++++++++++++++++++++++
+ 4 files changed, 45 insertions(+)
+ create mode 100644 compat/time32/sem_clockwait_time32.c
+ create mode 100644 src/thread/sem_clockwait.c
+
+diff --git a/compat/time32/sem_clockwait_time32.c b/compat/time32/sem_clockwait_time32.c
+new file mode 100644
+index 0000000..451e0f0
+--- /dev/null
++++ b/compat/time32/sem_clockwait_time32.c
+@@ -0,0 +1,9 @@
++#include "time32.h"
++#include <time.h>
++#include <semaphore.h>
++
++int __sem_clockwait_time32(sem_t *sem, clockid_t clock_id, const struct timespec32 *restrict ts32)
++{
++	return sem_clockwait(sem, clock_id, !ts32 ? 0 : (&(struct timespec){
++		.tv_sec = ts32->tv_sec, .tv_nsec = ts32->tv_nsec}));
++}
+diff --git a/compat/time32/time32.h b/compat/time32/time32.h
+index fdec17c..b2bac69 100644
+--- a/compat/time32/time32.h
++++ b/compat/time32/time32.h
+@@ -68,6 +68,7 @@ int __recvmmsg_time32() __asm__("recvmmsg");
+ int __sched_rr_get_interval_time32() __asm__("sched_rr_get_interval");
+ int __select_time32() __asm__("select");
+ int __sem_timedwait_time32() __asm__("sem_timedwait");
++int __sem_clockwait_time32() __asm__("sem_clockwait");
+ int __semtimedop_time32() __asm__("semtimedop");
+ int __setitimer_time32() __asm__("setitimer");
+ int __settimeofday_time32() __asm__("settimeofday");
+diff --git a/include/semaphore.h b/include/semaphore.h
+index 3690f49..0c7d56f 100644
+--- a/include/semaphore.h
++++ b/include/semaphore.h
+@@ -6,6 +6,7 @@ extern "C" {
+ 
+ #include <features.h>
+ 
++#define __NEED_clockid_t
+ #define __NEED_time_t
+ #define __NEED_struct_timespec
+ #include <bits/alltypes.h>
+@@ -25,12 +25,14 @@ int    sem_init(sem_t *, int, unsigned);
+ sem_t *sem_open(const char *, int, ...);
+ int    sem_post(sem_t *);
+ int    sem_timedwait(sem_t *__restrict, const struct timespec *__restrict);
++int    sem_clockwait(sem_t *__restrict, clockid_t, const struct timespec *__restrict);
+ int    sem_trywait(sem_t *);
+ int    sem_unlink(const char *);
+ int    sem_wait(sem_t *);
+ 
+ #if _REDIR_TIME64
+ __REDIR(sem_timedwait, __sem_timedwait_time64);
++__REDIR(sem_clockwait, __sem_clockwait_time64);
+ #endif
+ 
+ #ifdef __cplusplus
+diff --git a/src/thread/sem_clockwait.c b/src/thread/sem_clockwait.c
+new file mode 100644
+index 0000000..c67cc82
+--- /dev/null
++++ b/src/thread/sem_clockwait.c
+@@ -0,0 +1,33 @@
++#include <semaphore.h>
++#include <limits.h>
++#include "pthread_impl.h"
++
++static void cleanup(void *p)
++{
++	a_dec(p);
++}
++
++int sem_clockwait(sem_t *restrict sem, clockid_t clock_id, const struct timespec *restrict at)
++{
++	pthread_testcancel();
++
++	if (!sem_trywait(sem)) return 0;
++
++	int spins = 100;
++	while (spins-- && !(sem->__val[0] & SEM_VALUE_MAX) && !sem->__val[1])
++		a_spin();
++
++	while (sem_trywait(sem)) {
++		int r, priv = sem->__val[2];
++		a_inc(sem->__val+1);
++		a_cas(sem->__val, 0, 0x80000000);
++		pthread_cleanup_push(cleanup, (void *)(sem->__val+1));
++		r = __timedwait_cp(sem->__val, 0x80000000, clock_id, at, priv);
++		pthread_cleanup_pop(1);
++		if (r) {
++			errno = r;
++			return -1;
++		}
++	}
++	return 0;
++}
+-- 
+2.45.2
+
