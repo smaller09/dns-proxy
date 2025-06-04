@@ -14,3 +14,5 @@ usage:
                  | not in gfwlist
                  |------->intranet
 ~~~
+999-add-sem_clockwait.patch just add an clockwait semaphore function to musl. because almost all openwrt device don't have RTC, so NTP time sync may cause problem. 
+just put the file into toolchain/musl/patches. or revert the commit to use sem_timewait.
